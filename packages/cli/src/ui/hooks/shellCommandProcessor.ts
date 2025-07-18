@@ -243,93 +243,100 @@ export const useShellCommandProcessor = (
         commandToExecute = `{ ${command} }; __code=$?; pwd > "${pwdFilePath}"; exit $__code`;
       }
 
-      const execPromise = new Promise<void>((resolve) => {
+      const execPromise = (async () => {
         let lastUpdateTime = 0;
 
         onDebugMessage(`Executing in ${targetDir}: ${commandToExecute}`);
-        executeShellCommand(
-          commandToExecute,
-          targetDir,
-          abortSignal,
-          (streamedOutput) => {
-            // Throttle pending UI updates to avoid excessive re-renders.
-            if (Date.now() - lastUpdateTime > OUTPUT_UPDATE_INTERVAL_MS) {
-              setPendingHistoryItem({ type: 'info', text: streamedOutput });
-              lastUpdateTime = Date.now();
-            }
-          },
-          onDebugMessage,
-        )
-          .then((result) => {
-            // TODO(abhipatel12) - Consider updating pending item and using timeout to ensure
-            // there is no jump where intermediate output is skipped.
-            setPendingHistoryItem(null);
+        try {
+          const result = await executeShellCommand(
+            commandToExecute,
+            targetDir,
+            abortSignal,
+            (streamedOutput) => {
+              // Throttle pending UI updates to avoid excessive re-renders.
+              if (Date.now() - lastUpdateTime > OUTPUT_UPDATE_INTERVAL_MS) {
+                setPendingHistoryItem({ type: 'info', text: streamedOutput });
+                lastUpdateTime = Date.now();
+              }
+            },
+            onDebugMessage,
+          );
+          // TODO(abhipatel12) - Consider updating pending item and using timeout to ensure
+          // there is no jump where intermediate output is skipped.
+          setPendingHistoryItem(null);
 
-            let historyItemType: HistoryItemWithoutId['type'] = 'info';
-            let mainContent: string;
+          let historyItemType: HistoryItemWithoutId['type'] = 'info';
+          let mainContent: string;
 
-            // The context sent to the model utilizes a text tokenizer which means raw binary data is
-            // cannot be parsed and understood and thus would only pollute the context window and waste
-            // tokens.
-            if (isBinary(result.rawOutput)) {
-              mainContent =
-                '[Command produced binary output, which is not shown.]';
-            } else {
-              mainContent =
-                result.output.trim() || '(Command produced no output)';
-            }
+          // The context sent to the model utilizes a text tokenizer which means raw binary data is
+          // cannot be parsed and understood and thus would only pollute the context window and waste
+          // tokens.
+          if (isBinary(result.rawOutput)) {
+            mainContent =
+              '[Command produced binary output, which is not shown.]';
+          } else {
+            mainContent =
+              result.output.trim() || '(Command produced no output)';
+          }
 
-            let finalOutput = mainContent;
+          let finalOutput = mainContent;
 
-            if (result.error) {
-              historyItemType = 'error';
-              finalOutput = `${result.error.message}\n${finalOutput}`;
-            } else if (result.aborted) {
-              finalOutput = `Command was cancelled.\n${finalOutput}`;
-            } else if (result.signal) {
-              historyItemType = 'error';
-              finalOutput = `Command terminated by signal: ${result.signal}.\n${finalOutput}`;
-            } else if (result.exitCode !== 0) {
-              historyItemType = 'error';
-              finalOutput = `Command exited with code ${result.exitCode}.\n${finalOutput}`;
-            }
+          if (result.error) {
+            historyItemType = 'error';
+            finalOutput = `${result.error.message}\n${finalOutput}`;
+          } else if (result.aborted) {
+            finalOutput = `Command was cancelled.\n${finalOutput}`;
+          } else if (result.signal) {
+            historyItemType = 'error';
+            finalOutput = `Command terminated by signal: ${result.signal}.\n${finalOutput}`;
+          } else if (result.exitCode !== 0) {
+            historyItemType = 'error';
+            finalOutput = `Command exited with code ${result.exitCode}.\n${finalOutput}`;
+          }
 
-            if (pwdFilePath && fs.existsSync(pwdFilePath)) {
-              const finalPwd = fs.readFileSync(pwdFilePath, 'utf8').trim();
+          if (pwdFilePath) {
+            try {
+              const finalPwd = await fs.promises
+                .readFile(pwdFilePath, 'utf8')
+                .then((s) => s.trim());
               if (finalPwd && finalPwd !== targetDir) {
                 const warning = `WARNING: shell mode is stateless; the directory change to '${finalPwd}' will not persist.`;
                 finalOutput = `${warning}\n\n${finalOutput}`;
               }
+            } catch (e) {
+              // Ignore errors reading the temp file.
             }
+          }
 
-            // Add the complete, contextual result to the local UI history.
-            addItemToHistory(
-              { type: historyItemType, text: finalOutput },
-              userMessageTimestamp,
-            );
+          // Add the complete, contextual result to the local UI history.
+          addItemToHistory(
+            { type: historyItemType, text: finalOutput },
+            userMessageTimestamp,
+          );
 
-            // Add the same complete, contextual result to the LLM's history.
-            addShellCommandToGeminiHistory(geminiClient, rawQuery, finalOutput);
-          })
-          .catch((err) => {
-            setPendingHistoryItem(null);
-            const errorMessage =
-              err instanceof Error ? err.message : String(err);
-            addItemToHistory(
-              {
-                type: 'error',
-                text: `An unexpected error occurred: ${errorMessage}`,
-              },
-              userMessageTimestamp,
-            );
-          })
-          .finally(() => {
-            if (pwdFilePath && fs.existsSync(pwdFilePath)) {
-              fs.unlinkSync(pwdFilePath);
+          // Add the same complete, contextual result to the LLM's history.
+          addShellCommandToGeminiHistory(geminiClient, rawQuery, finalOutput);
+        } catch (err) {
+          setPendingHistoryItem(null);
+          const errorMessage =
+            err instanceof Error ? err.message : String(err);
+          addItemToHistory(
+            {
+              type: 'error',
+              text: `An unexpected error occurred: ${errorMessage}`,
+            },
+            userMessageTimestamp,
+          );
+        } finally {
+          if (pwdFilePath) {
+            try {
+              await fs.promises.unlink(pwdFilePath);
+            } catch (e) {
+              // Ignore errors unlinking the temp file.
             }
-            resolve();
-          });
-      });
+          }
+        }
+      })();
 
       onExec(execPromise);
       return true; // Command was initiated
